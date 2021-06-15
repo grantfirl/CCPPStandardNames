@@ -40,14 +40,19 @@ JSON_CHG_FILE = 'standard_name_changes.json'
 
 TEMP_TAG = '_meta_chg'
 
+INTERACTIVE = True
+
+GET_CLOSE_MATCHES_NONINTERACTIVE_CUTOFF = 0.5
+GET_CLOSE_MATCHES_SECOND_PASS_CUTOFF = 0.7
+
 ###############################################################################
 def parse_command_line(args, description):
 ###############################################################################
     parser = argparse.ArgumentParser(description=description,
                                      formatter_class=argparse.RawTextHelpFormatter)
 
-    parser.add_argument('-m', '--mode', help='script mode (u=check unknown variables, c=check changed variables, m=check changed variables and modify metadata)', 
-                        type=str, choices=('u','c','m'), required=True)
+    parser.add_argument('-m', '--mode', help='script mode (u=check unknown variables, c=check changed variables, m=check changed variables and modify metadata, use change file and modify metadata)', 
+                        type=str, choices=('u','c','m','r'), required=True)
     parser.add_argument("config_file",
                         metavar='<config file>',
                         type=str, help="ccpp_prebuild_config.py file")
@@ -63,6 +68,10 @@ def parse_command_line(args, description):
                         type=str, help="XML file with (current or changed) standard name library",
                         required=False,default=DEFAULT_STD_NM_XML)
     parser.add_argument('-ov','--overwrite',     help='flag to overwrite metadata defined in the ccpp_prebuild_config.py file', action='store_true')
+    parser.add_argument('-cf', '--change_file',
+                        metavar='<change file filename>',
+                        type=str, help="JSON file with changes to parse",
+                        required=False,default=JSON_CHG_FILE)
     
     pargs = parser.parse_args(args)
     return pargs
@@ -108,56 +117,144 @@ def find_changed_vars(old_file, new_file):
   
     with open(new_file) as file_2:
         file_2_text = file_2.readlines()
-  
+    
+    #first pass uses difflib's unified_diff, which relies heavily on position within the file
+    
     diff_lines = difflib.unified_diff(file_1_text, file_2_text, fromfile=old_file, 
         tofile=new_file, lineterm='',n=0)
     
     std_name_changes = []
-    n_replacements = 0
-    n_adds = 0
-    n_removals = 0
+    
+    minus_lines = []
+    plus_lines = []
     for line in (diff_lines):
         if '@@' in line:
-            #figure out how many lines that correspond to the hunk
-            if (',') in line: #if one comma on hunk line, there should be 2
-                n_lines_minus = int(line.split(',')[1].split(' ')[0])
-                n_lines_plus  = int(line.split(',')[2].split(' ')[0])
-            else:
-                #only one line has changed, so expect the old and new lines only
-                n_lines_minus = 1
-                n_lines_plus  = 1
-            n_lines = n_lines_minus + n_lines_plus
-            
-            #std_name_chg = []
-            if (n_lines_minus == n_lines_plus):
-                #expect one-for-one replacement
-                text_minus = []
-                text_plus = []
-                for i in range(n_lines_minus):
-                    text_minus.append(next(diff_lines))
-                for i in range(n_lines_plus):
-                    text_plus.append(next(diff_lines))
-                for i in range(len(text_minus)):
-                    if text_minus[i][0] == '-' and text_plus[i][0] == '+' and 'standard_name name=' in text_minus[i] and 'standard_name name=' in text_plus[i]:
-                        std_name_changes.append((text_minus[i].split('"')[1],text_plus[i].split('"')[1]))
-                        n_replacements += 1
-            elif (n_lines_minus == 0):
+            #print(minus_lines)
+            #print(plus_lines)
+            #process previous set of lines
+            if len(minus_lines) == len(plus_lines):
+                #expect one-to-one replacement
+                for i in range(len(minus_lines)):
+                    if 'standard_name name=' in minus_lines[i] and 'standard_name name=' in plus_lines[i]:
+                        std_name_changes.append((minus_lines[i].split('"')[1],plus_lines[i].split('"')[1]))
+            elif len(minus_lines) == 0:
                 #expect new names only
-                for i in range(n_lines_plus):
-                    text = next(diff_lines)
-                    if 'standard_name name=' in text:
-                        std_name_changes.append(('',text.split('"')[1]))
-                        n_adds += 1
-            elif (n_lines_plus == 0):
+                for i in range(len(plus_lines)):
+                    if 'standard_name name=' in plus_lines[i]:
+                        std_name_changes.append(('',plus_lines[i].split('"')[1]))
+            elif len(plus_lines) == 0:
                 #expect deleted names only
-                for i in range(n_lines_minus):
-                    text = next(diff_lines)
-                    if 'standard_name name=' in text:
-                        std_name_changes.append((text.split('"')[1],''))
-                        n_removals += 1
+                for i in range(len(minus_lines)):
+                    if 'standard_name name=' in minus_lines[i]:
+                        std_name_changes.append((minus_lines[i].split('"')[1],''))
             else:
-                print('Unexpected change encountered between {} and {}: {}'.format(old_file, new_file, line))
-                print('This change will not be parsed.')
+                potential_removals = []
+                potential_additions = []
+                for i in range(len(minus_lines)):
+                    if 'standard_name name=' in minus_lines[i]:
+                        potential_removals.append(minus_lines[i].split('"')[1])
+                for i in range(len(plus_lines)):
+                    if 'standard_name name=' in plus_lines[i]:
+                        potential_additions.append(plus_lines[i].split('"')[1])
+                if INTERACTIVE:
+                    #ask the user for help deciphering changes
+                    for i in range(len(potential_removals)):
+                        print('Do any of the following names represent a replacement for "{}"? (0 for None)'.format(potential_removals[i]))
+                        print('0. None')
+                        for j in range(len(potential_additions)):
+                            print('{0}. "{1}"'.format(j+1,potential_additions[j]))
+                        val = get_choice(range(len(potential_additions)+1))
+                        if int(val) > 0 and int(val) <= len(potential_additions):
+                            std_name_changes.append((potential_removals[i],potential_additions[int(val)-1]))
+                            potential_removals.remove(potential_removals[i])
+                            potential_additions.remove(potential_additions[int(val)-1])
+                            #print(std_name_changes[-1])
+                    for i in range(len(potential_removals)):
+                        std_name_changes.append((potential_removals[i],''))
+                    for j in range(len(potential_additions)):
+                        std_name_changes.append(('',potential_additions[j]))
+                else:
+                    #use difflib's get_close_matches to try to figure out replacements
+                    for i in range(len(potential_removals)):
+                        close_matches = difflib.get_close_matches(potential_removals[i],potential_additions,n=1,cutoff=GET_CLOSE_MATCHES_NONINTERACTIVE_CUTOFF)
+                        if len(close_matches) > 0:
+                            std_name_changes.append((potential_removals[i],close_matches[0]))
+                            potential_removals.remove(potential_removals[i])
+                            potential_additions.remove(close_matches[0])
+                            #print('get_close_match CHG: {} -> {}'.format(std_name_changes[-1][0],std_name_changes[-1][1]))
+                        else:
+                            print(potential_removals)
+                            std_name_changes.append((potential_removals[i],''))
+                    for i in range(len(potential_additions)):
+                        std_name_changes.append(('',potential_additions[i]))
+            
+            #reset line lists
+            minus_lines = []
+            plus_lines = []
+        elif line[0] == '-':
+            minus_lines.append(line)
+        elif line[0] == '+':
+            plus_lines.append(line)
+        else:
+            print('Unrecognized line in the unified diff: {}'.format(line))
+        
+    #second pass uses difflib's get_close_matches to look for replacements that might be out of position between the two files and for any matches for deletions (in that order)
+    
+    
+    std_nm_replacements = [x for x in std_name_changes if x[0] and x[1]]
+    std_nm_replacements_new = [x[1] for x in std_nm_replacements]
+    std_nm_new = [x[1] for x in std_name_changes if not x[0] and x[1]]
+    
+    for r in std_nm_replacements:
+        close_matches = difflib.get_close_matches(r[0],std_nm_new,n=1,cutoff=GET_CLOSE_MATCHES_SECOND_PASS_CUTOFF)
+        if len(close_matches) > 0:
+            print('The following close matches were found for "{0}" in the second difference pass: {1}'.format(r[0],close_matches))
+            #check which match (positional or contextual) is better (use 0.0 for cutoff, since both were matches, and order of result is by similarity score)
+            match_order = difflib.get_close_matches(r[0],[r[1],close_matches[0]],n=2,cutoff=0.0)
+            if match_order[0] == close_matches[0]:
+                #substitute the contextual replacement for the positional replacement
+                if close_matches[0] not in std_nm_replacements_new:
+                    #close match was a "new" standard name; remove the old replacement, make old match a new standard name, add the new replacement
+                    std_name_changes.remove(r)
+                    std_name_changes.append(('',r[1]))
+                    std_name_changes.append((r[0],close_matches[0]))
+                else:
+                    #close match was part of an existing match; remove the old replacement, make old match a new standard name, make old original name a deletion, add the new replacement
+                    std_name_changes.remove(r)
+                    std_name_changes.append(('',r[1]))
+                    close_match_orig = [x[0] for x in std_name_changes if x[1] == close_matches[0]][0]
+                    std_name_changes.append((close_match_orig,''))
+                    std_name_changes.append((r[0],close_matches[0]))
+    
+    #need to recalculate these lists because previous operation could have changed them
+    std_nm_replacements = [x for x in std_name_changes if x[0] and x[1]]
+    std_nm_replacements_new = [x[1] for x in std_nm_replacements]
+    std_nm_new = [x[1] for x in std_name_changes if not x[0] and x[1]]
+    std_nm_deletions = [x[0] for x in std_name_changes if x[0] and not x[1]]
+    
+    for d in std_nm_deletions:
+        close_matches = difflib.get_close_matches(d[0],std_nm_new,n=1,cutoff=GET_CLOSE_MATCHES_SECOND_PASS_CUTOFF)
+        if len(close_matches) > 0:
+            print('The following close matches were found for "{0}" in the second difference pass: {1}'.format(d[0],close_matches))
+            if close_matches[0] not in std_nm_replacements_new:
+                #use the new match (remove the separate deletions and additions; add a replacement)
+                std_name_changes.remove((d,''))
+                std_name_changes.remove(('',close_matches[0]))
+                std_name_changes.append((d,close_matches[0]))
+            else:    
+                #the match was already matched to something else
+                close_match_orig = [x[0] for x in std_name_changes if x[1] == close_matches[0]][0]
+                #check for which match (positional or contextual) has a higher string comparison score
+                match_order = difflib.get_close_matches(close_matches[0],[d[0],close_match_orig],n=2,cutoff=0.0)
+                if match_order[0] == d[0]:
+                    std_name_changes.remove(d)
+                    std_name_changes.append((close_match_orig,''))
+                    std_name_changes.append((d[0],close_matches[0]))
+    
+    n_replacements = len([x for x in std_name_changes if x[0] and x[1]])
+    n_adds = len([x for x in std_name_changes if not x[0] and x[1]])
+    n_removals = len([x for x in std_name_changes if x[0] and not x[1]])
+    
     return (std_name_changes, n_replacements, n_adds, n_removals)
 
 ###############################################################################
@@ -219,7 +316,36 @@ def edit_file_metadata(files, std_nm_replacements, overwrite):
                     new_filename = fn_root + TEMP_TAG + fn_ext
                 with open(new_filename,'w') as f:
                     f.write(contents)
+
+###############################################################################
+def parse_change_file(change_file, host_metadata, physics_metadata):
+###############################################################################
     
+    with open(change_file, 'r') as filehandle:
+        std_name_changes_from_file = json.load(filehandle)
+    
+    #validate the changes in the file (make sure that replacements have originals in standard name list)
+    std_name_changes = []
+    for change in std_name_changes_from_file:
+        if (change[0] and change[1]) and (change[0] not in host_metadata.keys() + physics_metadata.keys()):
+            print("The change {0} -> {1} cannot be implemented because {0} is not in the current host/physics metadata. Ignoring this change.".format(change[0],change[1]))
+        else:
+            std_name_changes.append(change)
+
+    n_replacements = len([x for x in std_name_changes if x[0] and x[1]])
+    n_adds = len([x for x in std_name_changes if not x[0] and x[1]])
+    n_removals = len([x for x in std_name_changes if x[0] and not x[1]])
+    
+    return(std_name_changes, n_replacements, n_adds, n_removals)
+    
+###############################################################################
+def get_choice(choices):
+###############################################################################
+  choice = -999
+  while choice not in choices:
+      choice = input("Enter your value: ")
+  return choice
+
 ###############################################################################
 def main_func():
 ###############################################################################
@@ -281,10 +407,30 @@ def main_func():
         
         #write out results
         if JSON_CHG_FILE:
+            #std_name_changes_dict = {}
+            #for i, change in enumerate(std_name_changes):
+            #    key, value = i, change
+            #    std_name_changes_dict[key] = value
             with open(JSON_CHG_FILE, 'w') as filehandle:
+                #json.dump(std_name_changes_dict, filehandle)
                 json.dump(std_name_changes, filehandle)
     
-    if (args.mode == 'm'):
+    if (args.mode == 'r'):
+        if os.path.isfile(args.change_file):
+            (std_name_changes, n_replacements, n_adds, n_removals) = parse_change_file(args.change_file, metadata_define, metadata_request)
+        
+            print('Read {0} changes ({1} replacements, {2} additions, {3} removals) in {4}:'.format(len(std_name_changes),n_replacements,n_adds,n_removals,args.change_file))
+            for chg in std_name_changes:
+                if not chg[0]:
+                    print('NEW: {}'.format(chg[1]))
+                elif not chg[1]:
+                    print('RM: {}'.format(chg[0]))
+                else:
+                    print('CHG: {} -> {}'.format(chg[0],chg[1]))
+        else:
+            print("{} is not a valid file. Exiting.".format(args.change_file))
+    
+    if (args.mode == 'm' or args.mode == 'r'):
         #for editing metadata files, only handle replacements for now (could extend to handle removals if necessary)
         std_nm_replacements = [x for x in std_name_changes if x[0] and x[1]]
         
