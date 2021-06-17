@@ -15,16 +15,21 @@ import os.path
 from xml_tools import read_xml_file
 sys.path.insert(1, './ccpp-framework/scripts')
 from ccpp_prebuild import import_config, gather_variable_definitions, collect_physics_subroutines
+from common import decode_container, decode_container_as_dict
 import difflib
 import json
 import re
 import copy
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
 
 # Default path to the current (or changed) standard name dictionary
 DEFAULT_STD_NM_XML = 'standard_names.xml'
 
 # Default path to the old standard name dictionary
 DEFAULT_OLD_STD_NM_XML = 'standard_names_old.xml'
+
+DEFAULT_GEN_XML = 'standard_names_gen.xml'
 
 # Filename of JSON file with list of host variables found in metadata but not in the standard name list (will not write if string is empty)
 #JSON_UNKNOWN_HOST_FILE = ''
@@ -40,7 +45,7 @@ JSON_CHG_FILE = 'standard_name_changes.json'
 
 TEMP_TAG = '_meta_chg'
 
-INTERACTIVE = True
+INTERACTIVE = False
 
 GET_CLOSE_MATCHES_NONINTERACTIVE_CUTOFF = 0.5
 GET_CLOSE_MATCHES_SECOND_PASS_CUTOFF = 0.7
@@ -51,8 +56,8 @@ def parse_command_line(args, description):
     parser = argparse.ArgumentParser(description=description,
                                      formatter_class=argparse.RawTextHelpFormatter)
 
-    parser.add_argument('-m', '--mode', help='script mode (u=check unknown variables, c=check changed variables, m=check changed variables and modify metadata, use change file and modify metadata)', 
-                        type=str, choices=('u','c','m','r'), required=True)
+    parser.add_argument('-m', '--mode', help='script mode (u=check unknown variables, c=check changed variables, m=check changed variables and modify metadata, r=use change file and modify metadata, x=generate XML file)', 
+                        type=str, choices=('u','c','m','r','x'), required=True)
     parser.add_argument("config_file",
                         metavar='<config file>',
                         type=str, help="ccpp_prebuild_config.py file")
@@ -79,6 +84,7 @@ def parse_command_line(args, description):
 ###############################################################################
 def check_unknown_vars(all_std_names, metadata_define, metadata_request, std_nm_file):
 ###############################################################################
+    
     known_host_vars = []
     unknown_host_vars = []
     for k, v in metadata_define.items():
@@ -110,6 +116,74 @@ def check_unknown_vars(all_std_names, metadata_define, metadata_request, std_nm_
             json.dump(unknown_physics_vars, filehandle)
 
 ###############################################################################
+def process_diff_lines(std_name_changes, minus_lines, plus_lines):
+###############################################################################
+    #print(minus_lines)
+    #print(plus_lines)
+    #process previous set of lines
+    if len(minus_lines) == len(plus_lines):
+        #expect one-to-one replacement
+        for i in range(len(minus_lines)):
+            if 'standard_name name=' in minus_lines[i] and 'standard_name name=' in plus_lines[i]:
+                std_name_changes.append((minus_lines[i].split('"')[1],plus_lines[i].split('"')[1]))
+    elif len(minus_lines) == 0:
+        #expect new names only
+        for i in range(len(plus_lines)):
+            if 'standard_name name=' in plus_lines[i]:
+                std_name_changes.append(('',plus_lines[i].split('"')[1]))
+    elif len(plus_lines) == 0:
+        #expect deleted names only
+        for i in range(len(minus_lines)):
+            if 'standard_name name=' in minus_lines[i]:
+                std_name_changes.append((minus_lines[i].split('"')[1],''))
+    else:
+        potential_removals = []
+        potential_additions = []
+        for i in range(len(minus_lines)):
+            if 'standard_name name=' in minus_lines[i]:
+                potential_removals.append(minus_lines[i].split('"')[1])
+        for i in range(len(plus_lines)):
+            if 'standard_name name=' in plus_lines[i]:
+                potential_additions.append(plus_lines[i].split('"')[1])
+        if INTERACTIVE:
+            #ask the user for help deciphering changes
+            processed_potential_removals = []
+            for i in range(len(potential_removals)):
+                print('Do any of the following names represent a replacement for "{}"? (0 for None)'.format(potential_removals[i]))
+                print('0. None')
+                for j in range(len(potential_additions)):
+                    print('{0}. "{1}"'.format(j+1,potential_additions[j]))
+                val = get_choice(range(len(potential_additions)+1))
+                if int(val) > 0 and int(val) <= len(potential_additions):
+                    std_name_changes.append((potential_removals[i],potential_additions[int(val)-1]))
+                    processed_potential_removals.append(potential_removals[i])
+                    #potential_removals.remove()
+                    potential_additions.remove(potential_additions[int(val)-1])
+                    #print(std_name_changes[-1])
+            potential_removals = [x for x in potential_removals if x not in processed_potential_removals]
+            for i in range(len(potential_removals)):
+                std_name_changes.append((potential_removals[i],''))
+            for j in range(len(potential_additions)):
+                std_name_changes.append(('',potential_additions[j]))
+        else:
+            #use difflib's get_close_matches to try to figure out replacements
+            processed_potential_removals = []
+            for i in range(len(potential_removals)):
+                close_matches = difflib.get_close_matches(potential_removals[i],potential_additions,n=1,cutoff=GET_CLOSE_MATCHES_NONINTERACTIVE_CUTOFF)
+                if len(close_matches) > 0:
+                    std_name_changes.append((potential_removals[i],close_matches[0]))
+                    processed_potential_removals.append(potential_removals[i])
+                    #potential_removals.remove(potential_removals[i])
+                    potential_additions.remove(close_matches[0])
+                    #print('get_close_match CHG: {} -> {}'.format(std_name_changes[-1][0],std_name_changes[-1][1]))
+                else:
+                    #print(potential_removals)
+                    std_name_changes.append((potential_removals[i],''))
+            for i in range(len(potential_additions)):
+                std_name_changes.append(('',potential_additions[i]))
+    
+    return std_name_changes
+###############################################################################
 def find_changed_vars(old_file, new_file):
 ###############################################################################
     with open(old_file) as file_1:
@@ -127,66 +201,10 @@ def find_changed_vars(old_file, new_file):
     
     minus_lines = []
     plus_lines = []
-    for line in (diff_lines):
+    for line in diff_lines:
+        line = line.lower()
         if '@@' in line:
-            #print(minus_lines)
-            #print(plus_lines)
-            #process previous set of lines
-            if len(minus_lines) == len(plus_lines):
-                #expect one-to-one replacement
-                for i in range(len(minus_lines)):
-                    if 'standard_name name=' in minus_lines[i] and 'standard_name name=' in plus_lines[i]:
-                        std_name_changes.append((minus_lines[i].split('"')[1],plus_lines[i].split('"')[1]))
-            elif len(minus_lines) == 0:
-                #expect new names only
-                for i in range(len(plus_lines)):
-                    if 'standard_name name=' in plus_lines[i]:
-                        std_name_changes.append(('',plus_lines[i].split('"')[1]))
-            elif len(plus_lines) == 0:
-                #expect deleted names only
-                for i in range(len(minus_lines)):
-                    if 'standard_name name=' in minus_lines[i]:
-                        std_name_changes.append((minus_lines[i].split('"')[1],''))
-            else:
-                potential_removals = []
-                potential_additions = []
-                for i in range(len(minus_lines)):
-                    if 'standard_name name=' in minus_lines[i]:
-                        potential_removals.append(minus_lines[i].split('"')[1])
-                for i in range(len(plus_lines)):
-                    if 'standard_name name=' in plus_lines[i]:
-                        potential_additions.append(plus_lines[i].split('"')[1])
-                if INTERACTIVE:
-                    #ask the user for help deciphering changes
-                    for i in range(len(potential_removals)):
-                        print('Do any of the following names represent a replacement for "{}"? (0 for None)'.format(potential_removals[i]))
-                        print('0. None')
-                        for j in range(len(potential_additions)):
-                            print('{0}. "{1}"'.format(j+1,potential_additions[j]))
-                        val = get_choice(range(len(potential_additions)+1))
-                        if int(val) > 0 and int(val) <= len(potential_additions):
-                            std_name_changes.append((potential_removals[i],potential_additions[int(val)-1]))
-                            potential_removals.remove(potential_removals[i])
-                            potential_additions.remove(potential_additions[int(val)-1])
-                            #print(std_name_changes[-1])
-                    for i in range(len(potential_removals)):
-                        std_name_changes.append((potential_removals[i],''))
-                    for j in range(len(potential_additions)):
-                        std_name_changes.append(('',potential_additions[j]))
-                else:
-                    #use difflib's get_close_matches to try to figure out replacements
-                    for i in range(len(potential_removals)):
-                        close_matches = difflib.get_close_matches(potential_removals[i],potential_additions,n=1,cutoff=GET_CLOSE_MATCHES_NONINTERACTIVE_CUTOFF)
-                        if len(close_matches) > 0:
-                            std_name_changes.append((potential_removals[i],close_matches[0]))
-                            potential_removals.remove(potential_removals[i])
-                            potential_additions.remove(close_matches[0])
-                            #print('get_close_match CHG: {} -> {}'.format(std_name_changes[-1][0],std_name_changes[-1][1]))
-                        else:
-                            print(potential_removals)
-                            std_name_changes.append((potential_removals[i],''))
-                    for i in range(len(potential_additions)):
-                        std_name_changes.append(('',potential_additions[i]))
+            std_name_changes = process_diff_lines(std_name_changes, minus_lines, plus_lines)
             
             #reset line lists
             minus_lines = []
@@ -197,6 +215,8 @@ def find_changed_vars(old_file, new_file):
             plus_lines.append(line)
         else:
             print('Unrecognized line in the unified diff: {}'.format(line))
+    #process the last diff hunk
+    std_name_changes = process_diff_lines(std_name_changes, minus_lines, plus_lines)
         
     #second pass uses difflib's get_close_matches to look for replacements that might be out of position between the two files and for any matches for deletions (in that order)
     
@@ -337,7 +357,53 @@ def parse_change_file(change_file, host_metadata, physics_metadata):
     n_removals = len([x for x in std_name_changes if x[0] and not x[1]])
     
     return(std_name_changes, n_replacements, n_adds, n_removals)
+
+###############################################################################
+def create_XML(metadata_define):
+###############################################################################
     
+    var_names = sorted(list(set(list(metadata_define.keys()))))
+    
+    var_dict_by_container = {}
+    #organize metadata by module and type
+    for var_name in var_names:
+        var = metadata_define[var_name][0]
+        target = decode_container_as_dict(var.container)
+        var_module = target.get('MODULE')
+        var_type = target.get('TYPE')
+        if var_module and var_module not in var_dict_by_container.keys():
+            var_dict_by_container[var_module] = {}
+        if var_module in var_dict_by_container.keys():
+            if var_type:
+                if var_type not in var_dict_by_container[var_module].keys():
+                    var_dict_by_container[var_module][var_type] = []
+            else:
+                if None not in var_dict_by_container[var_module].keys():
+                    var_dict_by_container[var_module][None] = []
+        var_dict_by_container[var_module][var_type].append(var_name)
+    
+    #sort the list of var_names alphabetically
+    for k1, v1 in var_dict_by_container.items():
+        for k2, v2 in v1.items():
+            v2 = sorted(v2)
+    
+    #write out the standard names to XML organized by module/type (put into separate sections); alphabetically within each section
+    root = ET.Element("standard_names", name="CCPP Standard Name Library", version="1.0")
+    for k1, v1 in var_dict_by_container.items():
+        for k2, v2 in v1.items():
+            if k2 is None:
+                sec = ET.SubElement(root, "section", name=k1)
+            else:
+                sec = ET.SubElement(root, "section", name=k1 + '_' + k2)
+            for var_name in v2:
+                name = ET.SubElement(sec, 'standard_name', {'name':var_name})
+                var = metadata_define[var_name][0]
+                ET.SubElement(name, "type", kind=var.kind, units=var.units).text = var.type
+    
+    tree = minidom.parseString(ET.tostring(root)).toprettyxml(indent="   ")
+    with open(DEFAULT_GEN_XML, "w") as f:
+        f.write(tree)
+
 ###############################################################################
 def get_choice(choices):
 ###############################################################################
@@ -380,17 +446,25 @@ def main_func():
     if not success:
        raise Exception('Call to collect_physics_subroutines failed.')
     
+    #convert metadata keys to lower case
+    for key in metadata_define.keys():
+        metadata_define[key.lower()] = metadata_define.pop(key)
+    for key in metadata_request.keys():
+        metadata_request[key.lower()] = metadata_request.pop(key)
+    
     stdname_file = os.path.abspath(args.standard_name_file)    
     _, root = read_xml_file(stdname_file)
         
     #get list of all standard names from the standard name file
     all_std_names = []
     for name in root.findall('./section/standard_name'):
-        all_std_names.append(name.attrib['name'])
+        all_std_names.append(name.attrib['name'].lower())
     
     if (args.mode == 'u'):
         #just check for standard names that are in host + physics metadata but NOT in the standard name library
         check_unknown_vars(all_std_names, metadata_define, metadata_request, args.standard_name_file)
+    elif (args.mode == 'x'):
+        create_XML(metadata_define) #, metadata_request) #metadata_define should be a superset of metadata_request
     elif (args.mode == 'c' or args.mode == 'm'):
         #determine additions, replacements, and removals for standard names given two standard name library files
         (std_name_changes, n_replacements, n_adds, n_removals) = find_changed_vars(args.old_standard_name_file, args.standard_name_file)
