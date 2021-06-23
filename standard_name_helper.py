@@ -45,7 +45,7 @@ JSON_CHG_FILE = 'standard_name_changes.json'
 
 TEMP_TAG = '_meta_chg'
 
-INTERACTIVE = False
+INTERACTIVE = True
 
 GET_CLOSE_MATCHES_NONINTERACTIVE_CUTOFF = 0.5
 GET_CLOSE_MATCHES_SECOND_PASS_CUTOFF = 0.7
@@ -219,8 +219,6 @@ def find_changed_vars(old_file, new_file):
     std_name_changes = process_diff_lines(std_name_changes, minus_lines, plus_lines)
         
     #second pass uses difflib's get_close_matches to look for replacements that might be out of position between the two files and for any matches for deletions (in that order)
-    
-    
     std_nm_replacements = [x for x in std_name_changes if x[0] and x[1]]
     std_nm_replacements_new = [x[1] for x in std_nm_replacements]
     std_nm_new = [x[1] for x in std_name_changes if not x[0] and x[1]]
@@ -235,16 +233,30 @@ def find_changed_vars(old_file, new_file):
                 #substitute the contextual replacement for the positional replacement
                 if close_matches[0] not in std_nm_replacements_new:
                     #close match was a "new" standard name; remove the old replacement, make old match a new standard name, add the new replacement
-                    std_name_changes.remove(r)
-                    std_name_changes.append(('',r[1]))
-                    std_name_changes.append((r[0],close_matches[0]))
+                    if INTERACTIVE:
+                        print('{0} was matched to {1}, but a different standard name may be a better match ({2}). Choose the replacement standard name:'.format(r[0],r[1],close_matches[0]))
+                        print('0. {}'.format(r[1]))
+                        print('1. {}'.format(close_matches[0]))
+                        val = get_choice((0,1))
+                    if (not INTERACTIVE or (INTERACTIVE and val == 1)):
+                        std_name_changes.remove(r)
+                        std_name_changes.remove(('',close_matches[0]))
+                        std_name_changes.append(('',r[1]))
+                        std_name_changes.append((r[0],close_matches[0]))
                 else:
                     #close match was part of an existing match; remove the old replacement, make old match a new standard name, make old original name a deletion, add the new replacement
-                    std_name_changes.remove(r)
-                    std_name_changes.append(('',r[1]))
-                    close_match_orig = [x[0] for x in std_name_changes if x[1] == close_matches[0]][0]
-                    std_name_changes.append((close_match_orig,''))
-                    std_name_changes.append((r[0],close_matches[0]))
+                    if INTERACTIVE:
+                        print('{0} was matched to {1}, but a different standard name may be a better match ({2}). Choose the replacement standard name:'.format(r[0],r[1],close_matches[0]))
+                        print('0. {}'.format(r[1]))
+                        print('1. {}'.format(close_matches[0]))
+                        val = get_choice((0,1))
+                    if (not INTERACTIVE or (INTERACTIVE and val == 1)):
+                        std_name_changes.remove(r)
+                        std_name_changes.append(('',r[1]))
+                        close_match_orig = [x[0] for x in std_name_changes if x[1] == close_matches[0]][0]
+                        std_name_changes.remove((close_match_orig,close_matches[0]))
+                        std_name_changes.append((close_match_orig,''))
+                        std_name_changes.append((r[0],close_matches[0]))
     
     #need to recalculate these lists because previous operation could have changed them
     std_nm_replacements = [x for x in std_name_changes if x[0] and x[1]]
@@ -311,10 +323,11 @@ def edit_config_metadata(config_file, std_nm_replacements, overwrite):
 def edit_file_metadata(files, std_nm_replacements, overwrite):
 ###############################################################################
     
-    for file in files:
+    for i, file in enumerate(files):
         #it is assumed that we start with a list of source files (not .meta files), so construct the .meta filename
         (fn_root, fn_ext) = os.path.splitext(file)
         meta_filename = fn_root + '.meta'
+        print('Processing file {0}: {1} of {2}'.format(meta_filename,i+1,len(files)))
         
         if os.path.isfile(meta_filename):
             #read in entire file contents
@@ -322,10 +335,42 @@ def edit_file_metadata(files, std_nm_replacements, overwrite):
                 contents = f.read()
             
             total_replacements = 0
+            pre_existing_replacement_names = []
             for r in std_nm_replacements:
                 #replace each standard name (whole word only) in the entire contents of the file and keep track of how many names have been replaced
-                (contents, n_replacements) = re.subn(r'\b%s\b' % r[0], r[1], contents)
-                total_replacements += n_replacements
+                if re.search(r'\b%s\b' % r[1], contents) == None:
+                    #replace all whole word instances of r[0]
+                    (contents, n_replacements) = re.subn(r'\b%s\b' % r[0], r[1], contents)
+                    #if the replaced word was within brackets, replace it back to the original
+                    contents = re.sub(r'\[\s*\b%s\b\s*\]' % r[1], '['+r[0]+']', contents)
+                    #(contents, n_replacements) = re.subn(r'\bstandard_name =\s*%s\b' % r[0], 'standard_name = '+r[1], contents)
+                    #contents = re.sub(r'.*dimensions =\s*\(.*\b%s\b.*\)' % r[0], replace_dimension(r), contents)
+                    total_replacements += n_replacements
+                else:
+                    #the replacement standard name already existed in contents; save the replacement operation to try again after the file is parsed once
+                    pre_existing_replacement_names.append(r)
+            
+            #after the file has already been changed, if there are some replacements that couldn't be done (due to the new standard name already existing in the file), try again (since it may have changed in the first pass)
+            impossible_replacements = []
+            for r in pre_existing_replacement_names:
+                if re.search(r'\b%s\b' % r[1], contents) == None:
+                    #(contents, n_replacements) = re.subn(r'\b%s\b^(\[\s*\b%s\b\s*\])' % (r[0], r[0]), r[1], contents)
+                    #(contents, n_replacements) = re.subn(r'\bstandard_name =\s*%s\b' % r[0], 'standard_name = '+r[1], contents)
+                    #replace all whole word instances of r[0]
+                    (contents, n_replacements) = re.subn(r'\b%s\b' % r[0], r[1], contents)
+                    #if the replaced word was within brackets, replace it back to the original
+                    contents = re.sub(r'\[\s*\b%s\b\s*\]' % r[1], '['+r[0]+']', contents)
+                    total_replacements += n_replacements
+                else:
+                    #the replacement standard name already existed in contents; save the replacement operation to try again after the file is parsed once
+                    impossible_replacements.append(r)
+            
+            if len(impossible_replacements) > 0:
+                print('The following replacements in {} could not be performed after two passes:'.format(meta_filename))
+                for r in impossible_replacements:
+                    print('{} -> {}'.format(r[0],r[1]))
+                print('Exiting early...')
+                sys.exit()
             
             #write out edited file if necessary, using either a temporary new metadata file or the existing metadata file
             if total_replacements > 0:
@@ -412,6 +457,64 @@ def get_choice(choices):
       choice = input("Enter your value: ")
   return choice
 
+def check_for_name_conflicts(std_name_changes, metadata_define):
+    
+    std_name_change_orig = [x[0] for x in std_name_changes]
+    std_name_change_new = [x[1] for x in std_name_changes]
+    
+    std_name_conflicts = []
+    for k, v in metadata_define.items():
+        #for every variable in the current metadata, check to see if the set of new standard names will cause duplication with existing ones
+        #it is OK if a new standard name is already being used in the current metadata as long as the current metadata will change too
+        if k in std_name_change_new:
+             if k not in std_name_change_orig:
+                 #these are the conflicts that are irreconcilable
+                 position = std_name_change_new.index(k)
+                 print('Using the new standard name "{0}" will lead to a conflict'.format(k))
+                 if std_name_change_orig[position]:
+                     print('You are trying to change the following variable:')
+                     target = decode_container_as_dict(metadata_define[std_name_changes[position][0]][0].container)
+                     var_module = target.get('MODULE')
+                     var_type = target.get('TYPE')
+                     print('{0} in {1}'.format(std_name_changes[position][0],var_module + '%' + var_type))
+                 else:
+                     print('You are trying to add the new standard name "{0}"'.format(k))
+                 print('but the standard name already exists for the following variable:')
+                 target = decode_container_as_dict(metadata_define[k][0].container)
+                 var_module = target.get('MODULE')
+                 var_type = target.get('TYPE')
+                 print('{0} in {1}'.format(k,var_module + '%' + var_type))
+                 std_name_conflicts.append((k,True))
+             else:
+                #these are the conflicts that are manageable with the right metadata editing order
+                std_name_conflicts.append((k,False))
+    
+    unmanageable_std_name_conflicts = [x[0] for x in std_name_conflicts if x[1]]
+    manageable_std_name_conflicts = [x[0] for x in std_name_conflicts if not x[1]]
+    
+    return (unmanageable_std_name_conflicts, manageable_std_name_conflicts)
+
+def reorder_standard_name_changes(manageable_std_name_conflicts, std_name_changes):
+    
+    print(len(std_name_changes))
+    print(std_name_changes[0:15])
+    
+    for n in manageable_std_name_conflicts:
+        std_name_orig = [x[0] for x in std_name_changes]
+        std_name_new = [x[1] for x in std_name_changes]
+        position = std_name_orig.index(n)
+        print(std_name_orig[position],std_name_new[position])
+        #print(std_name_changes.index((std_name_orig[position],std_name_new[position])))
+        #print(std_name_changes[position])
+        #std_name_changes.insert(0, std_name_changes.pop(std_name_changes.index((std_name_orig[position],std_name_new[position]))))
+        std_name_changes.insert(0, std_name_changes.pop(position))
+        
+    print(len(std_name_changes))
+    print(std_name_changes[0:15])
+    #sys.exit()
+    return std_name_changes
+    
+
 ###############################################################################
 def main_func():
 ###############################################################################
@@ -469,6 +572,13 @@ def main_func():
         #determine additions, replacements, and removals for standard names given two standard name library files
         (std_name_changes, n_replacements, n_adds, n_removals) = find_changed_vars(args.old_standard_name_file, args.standard_name_file)
         
+        (unmanageable_std_nm_conflicts, manageable_std_nm_conflicts) = check_for_name_conflicts(std_name_changes, metadata_define)
+        if(len(unmanageable_std_nm_conflicts) > 0):
+            print('Fix the following standard names with conflicts before trying again:')
+            print(unmanageable_std_nm_conflicts)
+            sys.exit()
+        std_name_changes = reorder_standard_name_changes(manageable_std_nm_conflicts, std_name_changes)
+        
         #print out results
         print('Detected {0} changes ({1} replacements, {2} additions, {3} removals) between {4} and {5}:'.format(len(std_name_changes),n_replacements,n_adds,n_removals,args.old_standard_name_file,args.standard_name_file))
         for chg in std_name_changes:
@@ -492,7 +602,14 @@ def main_func():
     if (args.mode == 'r'):
         if os.path.isfile(args.change_file):
             (std_name_changes, n_replacements, n_adds, n_removals) = parse_change_file(args.change_file, metadata_define, metadata_request)
-        
+            
+            (unmanageable_std_nm_conflicts, manageable_std_nm_conflicts) = check_for_name_conflicts(std_name_changes, metadata_define)
+            if(len(unmanageable_std_nm_conflicts) > 0):
+                print('Fix the following standard names with conflicts before trying again:')
+                print(unmanageable_std_nm_conflicts)
+                sys.exit()
+            std_name_changes = reorder_standard_name_changes(manageable_std_nm_conflicts, std_name_changes)
+            
             print('Read {0} changes ({1} replacements, {2} additions, {3} removals) in {4}:'.format(len(std_name_changes),n_replacements,n_adds,n_removals,args.change_file))
             for chg in std_name_changes:
                 if not chg[0]:
