@@ -255,8 +255,8 @@ Note that appending '_on_previous_timestep' to standard_names in this section yi
 Standard / required CCPP variables
 * `ccpp_error_message`: Error message for error handling in CCPP
     * `character(kind=len=512)`: units = none
-* `ccpp_error_code`: Error code for error handling in CCPP
-    * `integer(kind=)`: units = 1
+* `ccpp_error_flag`: Error flag for error handling in CCPP
+    * `integer(kind=)`: units = flag
 ## GFS_typedefs_GFS_control_type
 * `sigma_pressure_hybrid_coordinate_a_coefficient`: Sigma pressure hybrid coordinate a coefficient
     * `real(kind=kind_phys)`: units = Pa
